@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strings"
@@ -20,6 +21,12 @@ import (
 
 	"golang.org/x/net/proxy"
 )
+
+// SecretPromptRequest encapsulates a pending secret request from a remote host.
+type SecretPromptRequest struct {
+	Address  string
+	Response chan string
+}
 
 // NetworkManager orchestrates P2P connections via a local Tor proxy.
 type NetworkManager struct {
@@ -39,6 +46,12 @@ type NetworkManager struct {
 	MyPeerID         string              // Unique identifier for this instance
 	broadcastRunning bool                // Ensures only one broadcast handler runs
 	mu               sync.Mutex          // Guards concurrent access to maps and state
+
+	// Secret and Handshake Management
+	CurrentSecret    string
+	SecretPromptChan chan *SecretPromptRequest
+	pendingPrompt    *SecretPromptRequest
+	promptMu         sync.Mutex
 }
 
 // NewNetworkManager initializes a new NetworkManager with empty state.
@@ -52,6 +65,77 @@ func NewNetworkManager() *NetworkManager {
 		PeerNames:        make(map[string]string),
 		PeerColors:       make(map[string]string),
 		PeerDisplayNames: make(map[string]string),
+		SecretPromptChan: make(chan *SecretPromptRequest, 5),
+	}
+}
+
+// SetSecret dynamically updates the session secret for this host.
+func (nm *NetworkManager) SetSecret(secret string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	nm.CurrentSecret = strings.TrimSpace(secret)
+}
+
+// GetSecret safely retrieves the current session secret.
+func (nm *NetworkManager) GetSecret() string {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	return nm.CurrentSecret
+}
+
+// RequestSecretPrompt is invoked when connecting to a host that requires a secret.
+func (nm *NetworkManager) RequestSecretPrompt(address string) (string, error) {
+	req := &SecretPromptRequest{
+		Address:  address,
+		Response: make(chan string, 1),
+	}
+
+	nm.promptMu.Lock()
+	nm.pendingPrompt = req
+	nm.promptMu.Unlock()
+
+	select {
+	case nm.SecretPromptChan <- req:
+	default:
+	}
+
+	// Forward event to Incoming stream so AndroidCallback picks it up
+	select {
+	case nm.Incoming <- fmt.Sprintf("AUTH_SECRET_REQUIRED:%s", address):
+	default:
+	}
+
+	select {
+	case secret, ok := <-req.Response:
+		if !ok || secret == "" {
+			return "", fmt.Errorf("secret prompt cancelled")
+		}
+		return secret, nil
+	case <-time.After(120 * time.Second):
+		return "", fmt.Errorf("timeout waiting for secret")
+	}
+}
+
+// SubmitSecret satisfies a pending secret request.
+func (nm *NetworkManager) SubmitSecret(secret string) {
+	nm.promptMu.Lock()
+	defer nm.promptMu.Unlock()
+	if nm.pendingPrompt != nil {
+		select {
+		case nm.pendingPrompt.Response <- strings.TrimSpace(secret):
+		default:
+		}
+		nm.pendingPrompt = nil
+	}
+}
+
+// CancelSecret cancels any pending secret prompt.
+func (nm *NetworkManager) CancelSecret() {
+	nm.promptMu.Lock()
+	defer nm.promptMu.Unlock()
+	if nm.pendingPrompt != nil {
+		close(nm.pendingPrompt.Response)
+		nm.pendingPrompt = nil
 	}
 }
 
@@ -62,6 +146,8 @@ func (nm *NetworkManager) InitProxy(socksAddress string) {
 
 // Host initializes a Version 3 Onion Service for others to connect to.
 func (nm *NetworkManager) Host(ctx context.Context, keyPath string, secret string, masterKey []byte, progress chan<- string) error {
+	nm.SetSecret(secret)
+
 	if progress != nil {
 		progress <- "Loading private key..."
 	}
@@ -88,13 +174,13 @@ func (nm *NetworkManager) Host(ctx context.Context, keyPath string, secret strin
 		progress <- fmt.Sprintf("Listening locally on port %d", nm.LocalPort)
 	}
 
-	go nm.acceptLoop(listener, secret, progress)
+	go nm.acceptLoop(listener, progress)
 
 	return nil
 }
 
 // acceptLoop handles incoming peer connections on the hosted onion service.
-func (nm *NetworkManager) acceptLoop(listener net.Listener, secret string, progress chan<- string) {
+func (nm *NetworkManager) acceptLoop(listener net.Listener, progress chan<- string) {
 	peerCount := 0
 
 	for {
@@ -108,17 +194,17 @@ func (nm *NetworkManager) acceptLoop(listener net.Listener, secret string, progr
 		}
 
 		peerCount++
-		go nm.handlePeer(conn, secret, progress, peerCount)
+		go nm.handlePeer(conn, progress, peerCount)
 	}
 }
 
 // handlePeer manages the lifecycle of a newly connected peer, including handshake and disambiguation.
-func (nm *NetworkManager) handlePeer(conn net.Conn, secret string, progress chan<- string, peerNum int) {
+func (nm *NetworkManager) handlePeer(conn net.Conn, progress chan<- string, peerNum int) {
 	if progress != nil {
 		progress <- fmt.Sprintf("Peer %d connecting... Handshake...", peerNum)
 	}
 
-	sessionKey, peerName, peerColor, err := nm.performHandshakeHost(conn, secret)
+	sessionKey, peerName, peerColor, err := nm.performHandshakeHost(conn)
 	if err != nil {
 		nm.ErrorChan <- fmt.Errorf("handshake failed: %v", err)
 		conn.Close()
@@ -177,10 +263,11 @@ func (nm *NetworkManager) Connect(ctx context.Context, address string, secret st
 	}
 
 	if progress != nil {
-		progress <- "Connected. Verifying secret..."
+		progress <- "Connected. Performing handshake..."
 	}
 
-	if err := nm.performHandshakeClient(conn, secret); err != nil {
+	sessionKey, err := nm.performHandshakeClient(conn, address, secret)
+	if err != nil {
 		conn.Close()
 		return fmt.Errorf("handshake failed: %v", err)
 	}
@@ -191,7 +278,6 @@ func (nm *NetworkManager) Connect(ctx context.Context, address string, secret st
 
 	peerID := "host"
 	nm.MyPeerID = fmt.Sprintf("peer_self_%x", sha256.Sum256([]byte(time.Now().String())))[:16]
-	sessionKey := DeriveSessionKey(secret)
 
 	nm.mu.Lock()
 	nm.Connections[peerID] = conn
@@ -229,39 +315,112 @@ func (nm *NetworkManager) CheckConnection(address string) bool {
 	return true
 }
 
-// performHandshakeHost verifies the remote secret sent by a client.
-func (nm *NetworkManager) performHandshakeHost(conn net.Conn, secret string) ([]byte, string, string, error) {
+// performHandshakeHost greets the client and verifies the secret if configured.
+func (nm *NetworkManager) performHandshakeHost(conn net.Conn) ([]byte, string, string, error) {
 	conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
 	defer conn.SetReadDeadline(time.Time{})
+	defer conn.SetWriteDeadline(time.Time{})
+
+	activeSecret := nm.GetSecret()
+
+	if activeSecret == "" {
+		if _, err := fmt.Fprintf(conn, "AUTH_NONE\n"); err != nil {
+			return nil, "", "", fmt.Errorf("failed to send AUTH_NONE: %w", err)
+		}
+		reader := bufio.NewReader(conn)
+		resp, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, "", "", fmt.Errorf("client read error: %w", err)
+		}
+		_ = resp
+		sessionKey := DeriveSessionKey("rizoma_public_session")
+		return sessionKey, "anonymous", "240", nil
+	}
+
+	if _, err := fmt.Fprintf(conn, "AUTH_REQUIRED\n"); err != nil {
+		return nil, "", "", fmt.Errorf("failed to send AUTH_REQUIRED: %w", err)
+	}
 
 	reader := bufio.NewReader(conn)
-	hashStr, err := reader.ReadString('\n')
+	resp, err := reader.ReadString('\n')
 	if err != nil {
 		return nil, "", "", fmt.Errorf("read secret failed: %w", err)
 	}
-	hashStr = strings.TrimSpace(hashStr)
+	resp = strings.TrimSpace(resp)
 
-	expected := sha256Hash(secret)
-	if !strings.EqualFold(hashStr, expected) {
+	clientHash := resp
+	if strings.HasPrefix(resp, "AUTH_SECRET ") {
+		clientHash = strings.TrimSpace(strings.TrimPrefix(resp, "AUTH_SECRET "))
+	}
+
+	expected := sha256Hash(activeSecret)
+	if !strings.EqualFold(clientHash, expected) {
+		fmt.Fprintf(conn, "AUTH_FAIL\n")
 		return nil, "", "", fmt.Errorf("invalid secret")
 	}
 
-	sessionKey := DeriveSessionKey(secret)
+	if _, err := fmt.Fprintf(conn, "AUTH_OK\n"); err != nil {
+		return nil, "", "", fmt.Errorf("failed to send AUTH_OK: %w", err)
+	}
+
+	sessionKey := DeriveSessionKey(activeSecret)
 	return sessionKey, "anonymous", "240", nil
 }
 
-// performHandshakeClient sends the hashed secret to the host for verification.
-func (nm *NetworkManager) performHandshakeClient(conn net.Conn, secret string) error {
-	conn.SetWriteDeadline(time.Now().Add(60 * time.Second))
+// performHandshakeClient checks if a secret is required by the host before sending authentication.
+func (nm *NetworkManager) performHandshakeClient(conn net.Conn, address string, initialSecret string) ([]byte, error) {
+	conn.SetReadDeadline(time.Now().Add(120 * time.Second))
+	conn.SetWriteDeadline(time.Now().Add(120 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
 	defer conn.SetWriteDeadline(time.Time{})
 
-	hash := sha256Hash(secret)
-	_, err := fmt.Fprintf(conn, "%s\n", hash)
+	reader := bufio.NewReader(conn)
+	greeting, err := reader.ReadString('\n')
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to read greeting from host: %w", err)
+	}
+	greeting = strings.TrimSpace(greeting)
+
+	if greeting == "AUTH_NONE" {
+		fmt.Fprintf(conn, "AUTH_OK\n")
+		return DeriveSessionKey("rizoma_public_session"), nil
 	}
 
-	return nil
+	if greeting == "AUTH_REQUIRED" {
+		secretToUse := initialSecret
+		if secretToUse == "" {
+			var errPrompt error
+			secretToUse, errPrompt = nm.RequestSecretPrompt(address)
+			if errPrompt != nil {
+				return nil, errPrompt
+			}
+		}
+
+		hash := sha256Hash(secretToUse)
+		if _, err := fmt.Fprintf(conn, "AUTH_SECRET %s\n", hash); err != nil {
+			return nil, fmt.Errorf("failed to send secret hash: %w", err)
+		}
+
+		reply, err := reader.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("failed to read auth verification: %w", err)
+		}
+		reply = strings.TrimSpace(reply)
+
+		if reply == "AUTH_OK" {
+			return DeriveSessionKey(secretToUse), nil
+		}
+		return nil, fmt.Errorf("invalid secret")
+	}
+
+	// Fallback for legacy servers
+	hash := sha256Hash(initialSecret)
+	_, err = fmt.Fprintf(conn, "%s\n", hash)
+	if err != nil {
+		return nil, err
+	}
+	return DeriveSessionKey(initialSecret), nil
 }
 
 // sha256Hash returns the hex-encoded SHA-256 hash of the input string.
@@ -275,9 +434,21 @@ func sha256Hash(s string) string {
 func (nm *NetworkManager) startPeerIO(peerID string, conn net.Conn, sessionKey []byte, peerName string, peerColor string) {
 	// Reader Goroutine
 	go func() {
-		scanner := bufio.NewScanner(conn)
-		for scanner.Scan() {
-			text := scanner.Text()
+		reader := bufio.NewReader(conn)
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				nm.removePeer(peerID, peerName)
+				if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
+					nm.ErrorChan <- fmt.Errorf("peer %s disconnected: %v", peerName, err)
+				}
+				return
+			}
+			text := strings.TrimRight(line, "\r\n")
+			if text == "" {
+				continue
+			}
+
 			if len(sessionKey) > 0 {
 				decrypted, err := DecryptMessage(text, sessionKey)
 				if err != nil {
@@ -303,12 +474,6 @@ func (nm *NetworkManager) startPeerIO(peerID string, conn net.Conn, sessionKey [
 				nm.mu.Unlock()
 			}
 			nm.Incoming <- fmt.Sprintf("PEER_MSG:%s:%s:%s:%s", peerID, peerName, peerColor, text)
-		}
-
-		nm.removePeer(peerID, peerName)
-
-		if err := scanner.Err(); err != nil {
-			nm.ErrorChan <- fmt.Errorf("peer %s disconnected: %v", peerName, err)
 		}
 	}()
 

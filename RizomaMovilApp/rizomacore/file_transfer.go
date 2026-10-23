@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // FileMessage defines the structure for messages used during file transfer operations.
@@ -24,9 +25,28 @@ type FileMessage struct {
 }
 
 const (
-	// FileChunkSize defines the size of each data chunk (32KB).
-	FileChunkSize = 32 * 1024
+	// FileChunkSize defines the size of each data chunk (16KB for smoother streaming over Tor).
+	FileChunkSize = 16 * 1024
 )
+
+var (
+	downloadDirMu sync.Mutex
+	downloadDir   = "loadingbay_in"
+)
+
+// SetDownloadDirectory sets the directory where incoming files are stored on disk.
+func SetDownloadDirectory(dir string) {
+	downloadDirMu.Lock()
+	defer downloadDirMu.Unlock()
+	downloadDir = dir
+}
+
+// GetDownloadDirectory returns the currently configured download directory.
+func GetDownloadDirectory() string {
+	downloadDirMu.Lock()
+	defer downloadDirMu.Unlock()
+	return downloadDir
+}
 
 // FileTransferState maintains the progress and data of an active file transfer.
 type FileTransferState struct {
@@ -36,6 +56,9 @@ type FileTransferState struct {
 	Checksum    string         // Expected SHA-256 checksum
 	Chunks      map[int][]byte // Mapping of chunk indices to their binary data
 	Progress    int            // Number of chunks successfully received so far
+	Accepted    bool           // Has the recipient accepted this transfer
+	Completed   bool           // Have all chunks arrived
+	SavedPath   string         // Path where the file was saved
 }
 
 // SendFile reads a file from disk and broadcasts it in chunks through the outgoing channel.
@@ -253,11 +276,13 @@ func ReceiveFileChunk(msg FileMessage, transfers map[string]*FileTransferState) 
 			return nil, fmt.Errorf("incomplete transfer: got %d/%d chunks", state.Progress, state.TotalChunks)
 		}
 
-		// Finalize the transfer and save the file.
-		if err := saveFile(state, msg.Checksum); err != nil {
+		state.Completed = true
+		savedPath, err := saveFile(state, msg.Checksum)
+		if err != nil {
+			delete(transfers, filename)
 			return nil, err
 		}
-
+		state.SavedPath = savedPath
 		delete(transfers, filename)
 		return state, nil
 
@@ -270,18 +295,18 @@ func ReceiveFileChunk(msg FileMessage, transfers map[string]*FileTransferState) 
 	}
 }
 
-// saveFile reassembles chunks, verifies integrity via checksum, and saves the file to the 'loadingbay_in' directory.
-func saveFile(state *FileTransferState, checksum string) error {
-	loadingBayIn := "loadingbay_in"
+// saveFile reassembles chunks, verifies integrity via checksum, and saves the file to the configured download directory.
+func saveFile(state *FileTransferState, checksum string) (string, error) {
+	targetDir := GetDownloadDirectory()
 
-	if err := os.MkdirAll(loadingBayIn, 0755); err != nil {
-		return fmt.Errorf("failed to create loadingbay_in: %w", err)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create download directory: %w", err)
 	}
 
-	outPath := filepath.Join(loadingBayIn, state.Filename)
+	outPath := filepath.Join(targetDir, state.Filename)
 	outFile, err := os.Create(outPath)
 	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
+		return "", fmt.Errorf("failed to create output file: %w", err)
 	}
 	defer outFile.Close()
 
@@ -289,11 +314,11 @@ func saveFile(state *FileTransferState, checksum string) error {
 	for i := 0; i < state.TotalChunks; i++ {
 		chunk, exists := state.Chunks[i]
 		if !exists {
-			return fmt.Errorf("missing chunk %d", i)
+			return "", fmt.Errorf("missing chunk %d", i)
 		}
 
 		if _, err := outFile.Write(chunk); err != nil {
-			return fmt.Errorf("failed to write chunk %d: %w", i, err)
+			return "", fmt.Errorf("failed to write chunk %d: %w", i, err)
 		}
 		hasher.Write(chunk)
 	}
@@ -301,10 +326,10 @@ func saveFile(state *FileTransferState, checksum string) error {
 	actualChecksum := hex.EncodeToString(hasher.Sum(nil))
 	if !strings.EqualFold(actualChecksum, checksum) {
 		os.Remove(outPath)
-		return fmt.Errorf("checksum mismatch: expected %s, got %s", checksum, actualChecksum)
+		return "", fmt.Errorf("checksum mismatch: expected %s, got %s", checksum, actualChecksum)
 	}
 
-	return nil
+	return outPath, nil
 }
 
 // SaveFileFromBytes saves raw binary data directly to the 'loadingbay_in' directory under the specified filename.
