@@ -24,6 +24,7 @@ type ChatPayload struct {
 	Content    string            `json:"content"`
 	Name       string            `json:"name"`
 	Color      string            `json:"color"`
+	Whisper    bool              `json:"whisper,omitempty"` // Desktop's private /whisper messages (sent with SendToPeer)
 	Attachment *AttachmentHeader `json:"attachment,omitempty"`
 }
 
@@ -39,6 +40,12 @@ func (nm *NetworkManager) ConnectWithSecretAndroid(address, secret string) error
 	addr = strings.TrimPrefix(addr, "https://")
 	addr = strings.TrimSuffix(addr, "/")
 	addr = strings.TrimSuffix(addr, ":80")
+	// Desktop always dials "<id>.onion": its UI appends ".onion" when missing (e.g. after
+	// decrypting a shared session key, which only contains the service ID). Tor's SOCKS proxy
+	// treats a bare ID as a normal hostname, so do the same here.
+	if addr != "" && !strings.HasSuffix(addr, ".onion") {
+		addr += ".onion"
+	}
 
 	progress := make(chan string, 20)
 	go func() {
@@ -63,7 +70,7 @@ func (nm *NetworkManager) HostAndroid() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Listening locally on port %d", nm.LocalPort), nil
+	return fmt.Sprintf("Listening on %s.onion", nm.OnionAddr), nil
 }
 
 // JoinOrHostVoidAndroid connects to or hosts the shared Void instance.
@@ -122,6 +129,12 @@ func (nm *NetworkManager) StartEventLoop(cb AndroidCallback) {
 					// 1. Try parsing as FileMessage
 					var fileMsg FileMessage
 					if json.Unmarshal([]byte(content), &fileMsg) == nil && fileMsg.Type != "" {
+						// Desktop's host relays every file message to the other peers, except
+						// bradbury_offer (it carries no data: each receiver uses its own embedded copy).
+						if fileMsg.Type != "bradbury_offer" {
+							nm.relayFromPeer(peerID, content)
+						}
+
 						state, err := receiveFileChunkFrom(peerID, fileMsg, transfers)
 						if cb == nil {
 							continue
@@ -164,14 +177,25 @@ func (nm *NetworkManager) StartEventLoop(cb AndroidCallback) {
 
 					// 2. Parse regular chat message
 					var payload ChatPayload
-					if json.Unmarshal([]byte(content), &payload) == nil && payload.Content != "" {
-						if payload.Name != "" {
-							peerName = payload.Name
+					if json.Unmarshal([]byte(content), &payload) == nil {
+						// Desktop's host relays every chat message to the other peers, except whispers.
+						if !payload.Whisper {
+							nm.relayFromPeer(peerID, content)
 						}
-						if payload.Color != "" {
-							peerColor = payload.Color
+						if payload.Content != "" {
+							if payload.Name != "" {
+								peerName = payload.Name
+							}
+							if payload.Color != "" {
+								peerColor = payload.Color
+							}
+							content = payload.Content
+							if payload.Whisper {
+								// Desktop shows these as "[whisper from <name>]"; keep them distinguishable
+								// from public messages, since AndroidCallback has no private-message flag.
+								content = "[whisper] " + content
+							}
 						}
-						content = payload.Content
 					}
 
 					if cb != nil {

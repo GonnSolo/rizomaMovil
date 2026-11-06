@@ -129,6 +129,12 @@ class MainActivity : ComponentActivity() {
         // 2. Inicializar NetworkManager
         networkManager = Rizomacore.newNetworkManager()
         networkManager.initProxy("127.0.0.1:9050")
+        // ControlSocket de TorService (tor-android arranca Tor con --ControlSocket y
+        // --CookieAuthentication 0). El core lo usa para publicar el .onion al hospedar
+        // (p. ej. THE VOID), igual que Rizoma Desktop lo hace con bine.
+        networkManager.initTorControl(
+            "unix:" + File(getDir("TorService", Context.MODE_PRIVATE), "ControlSocket").absolutePath
+        )
 
         val downloadDir = File(getExternalFilesDir(null), "loadingbay_in")
         if (!downloadDir.exists()) {

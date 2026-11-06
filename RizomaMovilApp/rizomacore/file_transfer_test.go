@@ -126,9 +126,10 @@ func TestOfferValidation(t *testing.T) {
 	valid := buildStream(t, "ok.bin", randomBytes(t, 100))[0]
 
 	cases := map[string]func(m *FileMessage){
-		"no checksum":  func(m *FileMessage) { m.Checksum = "" },
-		"bad checksum": func(m *FileMessage) { m.Checksum = "zz" },
-		"zero size":    func(m *FileMessage) { m.FileSize = 0; m.TotalChunks = 0 },
+		"no checksum":         func(m *FileMessage) { m.Checksum = "" },
+		"bad checksum":        func(m *FileMessage) { m.Checksum = "zz" },
+		"negative size":       func(m *FileMessage) { m.FileSize = -1; m.TotalChunks = 0 },
+		"zero size w/ chunks": func(m *FileMessage) { m.FileSize = 0; m.TotalChunks = 1 },
 		"over max size": func(m *FileMessage) {
 			m.FileSize = MaxFileTransferBytes + 1
 			m.TotalChunks = expectedChunkCount(m.FileSize)

@@ -32,7 +32,12 @@ type SecretPromptRequest struct {
 type NetworkManager struct {
 	SocksAddress string // e.g. "127.0.0.1:9050"
 	LocalPort    int    // Port where the local TCP server is listening
-	OnionAddr    string // Local .onion address (set by Android)
+	OnionAddr    string // Local onion service ID (without ".onion"), set by Host like on Desktop
+
+	// Onion service publication (Desktop does this through bine's embedded Tor)
+	torControlAddr string            // Tor control address, see InitTorControl
+	hostListeners  []net.Listener    // Local listeners backing published onion services
+	onionControls  []*torControlConn // Control connections that own the published services
 
 	// Multi-peer management
 	Connections      map[string]net.Conn // peer_id -> active connection
@@ -144,7 +149,19 @@ func (nm *NetworkManager) InitProxy(socksAddress string) {
 	nm.SocksAddress = socksAddress
 }
 
+// InitTorControl configures Tor's control interface, which Host needs to publish the onion
+// service (Desktop does the same through bine). Accepted forms: "unix:/path/to/socket",
+// "tcp:host:port" or "host:port". With tor-android it is
+// "unix:" + File(context.getDir("TorService", MODE_PRIVATE), "ControlSocket").absolutePath.
+func (nm *NetworkManager) InitTorControl(address string) {
+	nm.mu.Lock()
+	nm.torControlAddr = strings.TrimSpace(address)
+	nm.mu.Unlock()
+}
+
 // Host initializes a Version 3 Onion Service for others to connect to.
+// Like Desktop, the service maps virtual port 80 to a local listener and is published with the
+// key from keyPath ("VOID" selects THE VOID's fixed key), so Desktop peers can reach it.
 func (nm *NetworkManager) Host(ctx context.Context, keyPath string, secret string, masterKey []byte, progress chan<- string) error {
 	nm.SetSecret(secret)
 
@@ -156,22 +173,42 @@ func (nm *NetworkManager) Host(ctx context.Context, keyPath string, secret strin
 	if err != nil {
 		return fmt.Errorf("failed to load/gen key: %v", err)
 	}
-	_ = privKey // Will be passed to Android Tor wrapper if needed
 
-	if progress != nil {
-		progress <- "Setting up local TCP Listener..."
+	nm.mu.Lock()
+	controlAddr := nm.torControlAddr
+	nm.mu.Unlock()
+	if controlAddr == "" {
+		// Without the control interface the service would only listen locally and no peer could
+		// ever reach it, so fail instead of pretending to host.
+		return fmt.Errorf("cannot publish onion service: Tor control address not configured (call InitTorControl)")
 	}
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return fmt.Errorf("failed to start local listener: %v", err)
 	}
-	
-	nm.LocalPort = listener.Addr().(*net.TCPAddr).Port
+	localPort := listener.Addr().(*net.TCPAddr).Port
+
+	if progress != nil {
+		progress <- "Setting up Onion Service..."
+	}
+
+	serviceID, ctrl, err := publishOnionService(ctx, controlAddr, privKey, 80, localPort)
+	if err != nil {
+		listener.Close()
+		return fmt.Errorf("failed to create onion service: %v", err)
+	}
+
+	nm.mu.Lock()
+	nm.LocalPort = localPort
+	nm.OnionAddr = serviceID
+	nm.hostListeners = append(nm.hostListeners, listener)
+	nm.onionControls = append(nm.onionControls, ctrl)
+	nm.mu.Unlock()
 	nm.MyPeerID = "host"
 
 	if progress != nil {
-		progress <- fmt.Sprintf("Listening locally on port %d", nm.LocalPort)
+		progress <- fmt.Sprintf("Listening on %s.onion", serviceID)
 	}
 
 	go nm.acceptLoop(listener, progress)
@@ -628,9 +665,45 @@ func (nm *NetworkManager) Close() {
 	nm.PeerColors = make(map[string]string)
 	nm.PeerDisplayNames = make(map[string]string)
 
-
+	// Stop hosting: closing the owning control connection makes Tor remove the onion service,
+	// as Desktop's TorInstance.Close() does.
+	for _, l := range nm.hostListeners {
+		l.Close()
+	}
+	nm.hostListeners = nil
+	for _, c := range nm.onionControls {
+		c.Close()
+	}
+	nm.onionControls = nil
 
 	nm.OnionAddr = ""
+}
+
+// relayFromPeer forwards a message received from an inbound peer (one that connected to a
+// service we host) to every other inbound peer, like Rizoma Desktop's host does with "RELAY:".
+// Outbound connections (id "host": sessions where we are the client) are skipped, so a hosted
+// room is never leaked into another session.
+func (nm *NetworkManager) relayFromPeer(senderID, msg string) {
+	if senderID == "" || senderID == "host" {
+		return
+	}
+	nm.mu.Lock()
+	targets := make([]string, 0, len(nm.Connections))
+	for id := range nm.Connections {
+		if id != senderID && id != "host" {
+			targets = append(targets, id)
+		}
+	}
+	nm.mu.Unlock()
+
+	for _, id := range targets {
+		if err := nm.SendToPeer(id, msg); err != nil {
+			select {
+			case nm.ErrorChan <- fmt.Errorf("relay to %s failed: %v", id, err):
+			default:
+			}
+		}
+	}
 }
 
 // loadOrGenerateKey loads an Ed25519 private key from disk or creates a new one, supporting optional encryption.
