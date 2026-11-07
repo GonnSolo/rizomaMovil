@@ -657,7 +657,9 @@ func receiveFileChunkFrom(peerID string, msg FileMessage, transfers map[string]*
 	case "file_offer":
 		purgeStaleTransfersLocked(transfers, time.Now())
 
-		if msg.FileSize <= 0 || msg.FileSize > MaxFileTransferBytes {
+		// Empty files are valid: Rizoma Desktop sends them as file_size 0, total_chunks 0, no
+		// chunks and a file_end, and saves them on its side.
+		if msg.FileSize < 0 || msg.FileSize > MaxFileTransferBytes {
 			return nil, fmt.Errorf("%w: invalid file size %d (max %s)", errTransferRejected, msg.FileSize, FormatFileSize(MaxFileTransferBytes))
 		}
 		if want := expectedChunkCount(msg.FileSize); msg.TotalChunks != want {
