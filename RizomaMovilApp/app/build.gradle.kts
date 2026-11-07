@@ -85,4 +85,7 @@ dependencies {
 
   // Tor Android (Guardian Project)
   implementation("info.guardianproject:tor-android:0.4.8.16")
+
+  // QR scanning through the system camera flow.
+  implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 }
