@@ -8,7 +8,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
-import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -53,6 +52,8 @@ import org.torproject.jni.TorService
 import rizomacore.AndroidCallback
 import rizomacore.NetworkManager
 import rizomacore.Rizomacore
+import java.io.File
+import java.io.FileOutputStream
 
 enum class Screen {
     PASSWORD_AUTH,
@@ -62,7 +63,6 @@ enum class Screen {
 }
 
 class MainActivity : ComponentActivity() {
-
     private val mainHandler = Handler(Looper.getMainLooper())
     private lateinit var cryptoStorage: CryptoStorage
     private lateinit var networkManager: NetworkManager
@@ -96,6 +96,10 @@ class MainActivity : ComponentActivity() {
             qrImportError = null
         }
     }
+
+    // Mapa reactivo de adjuntos multimedia indexado por nombre/ruta para renderizar vistas previas
+    // sin romper la estructura actual de EncryptedChatMessage ni CryptoStorage.
+    val attachmentsByFilename = mutableStateMapOf<String, AttachmentItemUi>()
 
     private val torStatusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -162,7 +166,10 @@ class MainActivity : ComponentActivity() {
         }
         networkManager.setStorageDirectory(downloadDir.absolutePath)
 
-        // 3. Callback de GoMobile
+        // 3. Callback de GoMobile con soporte multimedia estilo Briar
+        // CORRECCIÓN CRÍTICA: En network.go, `fromPeer` durante transferencias de archivos suele ser
+        // "Host" o "anonymous", lo cual antes no coincidía con `activeContact.alias` e impedía
+        // que los archivos recibidos aparecieran en pantalla. Ahora se entregan al chat activo.
         val goCallback = object : AndroidCallback {
             override fun onSystemMessage(msg: String?) {
                 if (msg != null && msg.startsWith("AUTH_SECRET_REQUIRED:")) {
@@ -187,12 +194,11 @@ class MainActivity : ComponentActivity() {
                     timestamp = System.currentTimeMillis()
                 )
 
-                // Save message encrypted under sender's contact alias or active chat
-                val targetAlias = activeContact?.alias ?: safeName
-                cryptoStorage.saveMessage(targetAlias, chatMsg)
-
                 mainHandler.post {
-                    if (activeContact != null && (activeContact?.alias.equals(safeName, ignoreCase = true) || activeContact?.alias == targetAlias)) {
+                    val contact = getOrCreatePeerContact(safeName)
+                    cryptoStorage.saveMessage(contact.alias, chatMsg)
+
+                    if (activeContact?.alias == contact.alias) {
                         activeChatMessages.add(chatMsg)
                     }
                 }
@@ -200,42 +206,84 @@ class MainActivity : ComponentActivity() {
 
             override fun onFileOffer(filename: String?, fileSize: Long, fromPeer: String?) {
                 val safePeer = fromPeer?.ifEmpty { "Peer" } ?: "Peer"
-                val safeName = filename ?: "archivo"
-                val sizeKb = (fileSize / 1024).coerceAtLeast(1)
+                val safeName = MultimediaAttachmentHelper.sanitizeFilename(filename ?: "archivo")
+                val offerItem = MultimediaAttachmentHelper.createIncomingOfferItem(safeName, fileSize)
+                val sizeFormatted = MultimediaAttachmentHelper.formatBytes(fileSize)
+
                 val infoMsg = EncryptedChatMessage(
                     sender = "SISTEMA",
-                    text = "📥 Recibiendo archivo: $safeName (${sizeKb} KB) de $safePeer...",
+                    text = "📥 Recibiendo multimedia: $safeName ($sizeFormatted) [0/${offerItem.totalChunks} chunks]",
                     color = "VOID",
                     timestamp = System.currentTimeMillis()
                 )
-                val targetAlias = activeContact?.alias ?: safePeer
-                cryptoStorage.saveMessage(targetAlias, infoMsg)
+
                 mainHandler.post {
-                    if (activeContact != null && (activeContact?.alias.equals(safePeer, ignoreCase = true) || activeContact?.alias == targetAlias)) {
+                    val contact = getOrCreatePeerContact(safePeer)
+                    cryptoStorage.saveMessage(contact.alias, infoMsg)
+
+                    attachmentsByFilename[safeName] = offerItem
+                    if (activeContact?.alias == contact.alias) {
                         activeChatMessages.add(infoMsg)
                     }
                 }
             }
 
             override fun onFileProgress(filename: String?, progress: Long, total: Long) {
-                // Background transfer progress
+                val safeName = MultimediaAttachmentHelper.sanitizeFilename(filename ?: return)
+                val safeTotal = total.coerceAtLeast(1L)
+                val pct = ((progress.toFloat() / safeTotal.toFloat()) * 100f).toInt().coerceIn(0, 100)
+
+                mainHandler.post {
+                    val existing = attachmentsByFilename[safeName]
+                    if (existing != null) {
+                        attachmentsByFilename[safeName] = existing.copy(
+                            chunksCompleted = progress,
+                            totalChunks = safeTotal
+                        )
+                    }
+
+                    // Actualizar en tiempo real el mensaje de progreso en la ventana de chat
+                    val idx = activeChatMessages.indexOfLast {
+                        it.sender == "SISTEMA" && it.text.contains(safeName) && it.text.startsWith("📥")
+                    }
+                    if (idx >= 0) {
+                        val old = activeChatMessages[idx]
+                        activeChatMessages[idx] = old.copy(
+                            text = "📥 Recibiendo multimedia: $safeName — $pct% ($progress/$safeTotal chunks)"
+                        )
+                    }
+                }
             }
 
             override fun onFileReceived(filename: String?, localPath: String?, fromPeer: String?) {
                 val safePeer = fromPeer?.ifEmpty { "Peer" } ?: "Peer"
-                val safeName = filename ?: "archivo"
+                val safeName = MultimediaAttachmentHelper.sanitizeFilename(filename ?: "archivo")
                 val safePath = localPath ?: ""
+                val finalItem = MultimediaAttachmentHelper.finalizeReceivedItem(safeName, safePath)
+                val dims = if (finalItem.width > 0 && finalItem.height > 0) " (${finalItem.width}x${finalItem.height}px)" else ""
+
                 val doneMsg = EncryptedChatMessage(
                     sender = safePeer,
-                    text = "📎 [ARCHIVO RECIBIDO: $safeName]\nGuardado en: $safePath",
-                    color = "196",
+                    text = "📎 [MULTIMEDIA RECIBIDO: $safeName]$dims\nTipo: ${finalItem.mimeType} (${MultimediaAttachmentHelper.formatBytes(finalItem.fileSize)})\nGuardado en: $safePath",
+                    color = "46",
                     timestamp = System.currentTimeMillis()
                 )
-                val targetAlias = activeContact?.alias ?: safePeer
-                cryptoStorage.saveMessage(targetAlias, doneMsg)
+
                 mainHandler.post {
-                    if (activeContact != null && (activeContact?.alias.equals(safePeer, ignoreCase = true) || activeContact?.alias == targetAlias)) {
-                        activeChatMessages.add(doneMsg)
+                    val contact = getOrCreatePeerContact(safePeer)
+                    cryptoStorage.saveMessage(contact.alias, doneMsg)
+
+                    attachmentsByFilename[safeName] = finalItem
+                    if (activeContact?.alias == contact.alias) {
+                        // Reemplazar la línea de progreso por la confirmación final o agregarla
+                        val progressIdx = activeChatMessages.indexOfLast {
+                            it.sender == "SISTEMA" && it.text.contains(safeName) && it.text.startsWith("📥")
+                        }
+                        if (progressIdx >= 0) {
+                            activeChatMessages[progressIdx] = doneMsg
+                        } else {
+                            activeChatMessages.add(doneMsg)
+                        }
                     }
                 }
             }
@@ -261,6 +309,9 @@ class MainActivity : ComponentActivity() {
                                 errorMessage = passwordError,
                                 onPasswordEntered = { password, requireOnStart ->
                                     handlePasswordSubmit(password, requireOnStart)
+                                },
+                                onResetPassword = {
+                                    handleResetPassword()
                                 }
                             )
                         }
@@ -384,7 +435,7 @@ class MainActivity : ComponentActivity() {
                                         fontWeight = FontWeight.Bold,
                                         fontSize = 14.sp
                                     )
-                                    val displayAddr = if (pendingSecretAddress.length > 22) pendingSecretAddress.take(18) + "..." else pendingSecretAddress
+                                    val displayAddr = if (pendingSecretAddress.length > 22) pendingSecretAddress.take(10) + "..." + pendingSecretAddress.takeLast(8) else pendingSecretAddress
                                     Text(
                                         text = "El servidor en $displayAddr requiere un secret de sesión.",
                                         color = TerminalTextMuted,
@@ -622,9 +673,65 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun handleResetPassword() {
+        cryptoStorage.resetAllData()
+        contacts.clear()
+        activeChatMessages.clear()
+        activeContact = null
+        attachmentsByFilename.clear()
+        myNickname = cryptoStorage.getMyNickname()
+        myColor = cryptoStorage.getMyColor()
+        myOnionAddress = cryptoStorage.getMyOnionAddress()
+        isFirstTime = true
+        passwordError = "Datos reiniciados. Configura una nueva contraseña."
+        currentScreen = Screen.PASSWORD_AUTH
+    }
+
     private fun loadContactsData() {
         contacts.clear()
         contacts.addAll(cryptoStorage.loadContacts())
+    }
+
+    /**
+     * Resolves an existing contact for an incoming peer or creates a new "Contacto Pendiente".
+     * If created and the user is on the Contacts screen, automatically opens the chat.
+     */
+    private fun getOrCreatePeerContact(peerName: String): Contact {
+        val safe = peerName.ifBlank { "Peer" }
+        // 1. Search in contacts
+        val existing = contacts.find {
+            it.alias.equals(safe, ignoreCase = true) ||
+            it.alias.equals("$safe (Contacto Pendiente)", ignoreCase = true) ||
+            it.alias.contains(safe, ignoreCase = true)
+        }
+        if (existing != null) {
+            return existing
+        }
+
+        // 2. Search if active contact matches
+        if (activeContact != null && (activeContact?.alias.equals(safe, ignoreCase = true) || activeContact?.alias?.contains(safe, ignoreCase = true) == true)) {
+            return activeContact!!
+        }
+
+        // 3. Create as "Contacto Pendiente"
+        val pendingContact = Contact(
+            slot = contacts.size + 1,
+            alias = "$safe (Contacto Pendiente)",
+            onionAddress = "",
+            secret = ""
+        )
+        contacts.add(pendingContact)
+        cryptoStorage.saveContact(pendingContact)
+
+        // If currently on Contacts screen, auto-open chat with this pending contact
+        if (currentScreen == Screen.CONTACTS) {
+            activeContact = pendingContact
+            activeChatMessages.clear()
+            activeChatMessages.addAll(cryptoStorage.loadMessages(pendingContact.alias))
+            currentScreen = Screen.CHAT
+        }
+
+        return pendingContact
     }
 
     private fun openChatWithContact(contact: Contact) {
@@ -633,16 +740,18 @@ class MainActivity : ComponentActivity() {
         activeChatMessages.addAll(cryptoStorage.loadMessages(contact.alias))
         currentScreen = Screen.CHAT
 
-        // Connect via Tor in background
-        Thread {
-            try {
-                if (contact.secret.isNotEmpty()) {
-                    networkManager.connectWithSecretAndroid(contact.onionAddress, contact.secret)
-                } else {
-                    networkManager.connectAndroid(contact.onionAddress)
-                }
-            } catch (_: Exception) {}
-        }.start()
+        // Connect via Tor in background only if onionAddress is present
+        if (contact.onionAddress.isNotBlank()) {
+            Thread {
+                try {
+                    if (contact.secret.isNotEmpty()) {
+                        networkManager.connectWithSecretAndroid(contact.onionAddress, contact.secret)
+                    } else {
+                        networkManager.connectAndroid(contact.onionAddress)
+                    }
+                } catch (_: Exception) {}
+            }.start()
+        }
     }
 
     private fun openTheVoidChat() {
@@ -687,31 +796,64 @@ class MainActivity : ComponentActivity() {
         }.start()
     }
 
+    /**
+     * Implementación del pipeline de envío de adjuntos de Briar (`AttachmentCreatorImpl` + `ImageCompressorImpl`):
+     * 1. Sanitiza el nombre del archivo y detecta su tipo MIME.
+     * 2. Si es una imagen (JPEG/PNG/WebP), aplica la compresión iterativa de Briar (máx 1000px,
+     *    eliminación de metadatos EXIF y ajuste de calidad JPEG <= 256 KB) en segundo plano.
+     * 3. Guarda copia local en `<externalFilesDir>/loadingbay_in/sent/` y transmite en chunks de 16 KB.
+     */
     private fun sendFile(filename: String, bytes: ByteArray) {
         val current = activeContact ?: return
-        val sizeKb = (bytes.size / 1024).coerceAtLeast(1)
-        val chatMsg = EncryptedChatMessage(
-            sender = myNickname,
-            text = "📎 Enviando archivo: $filename ($sizeKb KB)...",
-            color = if (current.alias == "THE VOID") "VOID" else myColor,
-            timestamp = System.currentTimeMillis()
-        )
+        if (bytes.isEmpty()) return
 
-        // 1. Add locally
-        activeChatMessages.add(chatMsg)
-
-        // 2. Persist encrypted
-        cryptoStorage.saveMessage(current.alias, chatMsg)
-
-        // 3. Send file via Go in background thread
         Thread {
             try {
-                networkManager.sendFileBytesAndroid(filename, bytes)
+                var cleanName = MultimediaAttachmentHelper.sanitizeFilename(filename)
+                var mimeType = MultimediaAttachmentHelper.resolveMimeTypeFromFilename(cleanName)
+                var payloadBytes = bytes
+                var dimsInfo = ""
+
+                // Paso 1: Si es imagen, comprimir y limpiar EXIF como en Briar ImageCompressorImpl
+                if (mimeType.startsWith("image/") && mimeType != "image/gif") {
+                    val compressed = BriarImageCompressor.compressImage(bytes, mimeType)
+                    payloadBytes = compressed.bytes
+                    mimeType = compressed.mimeType
+                    if (compressed.width > 0 && compressed.height > 0) {
+                        dimsInfo = " [${compressed.width}x${compressed.height}px, EXIF limpio]"
+                    }
+                    if (!cleanName.lowercase().endsWith(".jpg") && !cleanName.lowercase().endsWith(".jpeg")) {
+                        val base = cleanName.substringBeforeLast('.', cleanName)
+                        cleanName = "$base.jpg"
+                    }
+                }
+
+                // Paso 2: Guardar copia local para el remitente (estilo Briar addLocalAttachment)
+                val sentDir = File(getExternalFilesDir(null), "loadingbay_in/sent").apply { mkdirs() }
+                val localSentFile = File(sentDir, cleanName)
+                FileOutputStream(localSentFile).use { it.write(payloadBytes) }
+
+                val formattedSize = MultimediaAttachmentHelper.formatBytes(payloadBytes.size.toLong())
+                val chatMsg = EncryptedChatMessage(
+                    sender = myNickname,
+                    text = "📎 Enviando multimedia: $cleanName ($formattedSize)$dimsInfo...",
+                    color = if (current.alias == "THE VOID") "VOID" else myColor,
+                    timestamp = System.currentTimeMillis()
+                )
+
+                mainHandler.post {
+                    activeChatMessages.add(chatMsg)
+                    cryptoStorage.saveMessage(current.alias, chatMsg)
+                }
+
+                // Paso 3: Enviar por Tor en chunks de 16 KB (compatible con RizomaCore.aar actual y nuevo)
+                networkManager.sendFileBytesAndroid(cleanName, payloadBytes)
+
                 mainHandler.post {
                     val sentMsg = EncryptedChatMessage(
                         sender = "SISTEMA",
-                        text = "✅ Archivo enviado exitosamente: $filename",
-                        color = "VOID",
+                        text = "✅ Multimedia enviado: $cleanName ($formattedSize)\nCopia local: ${localSentFile.absolutePath}",
+                        color = "46",
                         timestamp = System.currentTimeMillis()
                     )
                     activeChatMessages.add(sentMsg)
@@ -721,7 +863,7 @@ class MainActivity : ComponentActivity() {
                 mainHandler.post {
                     val errMsg = EncryptedChatMessage(
                         sender = "SISTEMA",
-                        text = "❌ Error enviando archivo $filename: ${e.message}",
+                        text = "❌ Error enviando multimedia $filename: ${e.message}",
                         color = "VOID",
                         timestamp = System.currentTimeMillis()
                     )
