@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/url"
 	"strings"
 )
 
@@ -193,4 +195,98 @@ func DecryptBytes(data []byte, key []byte) ([]byte, error) {
 
 	nonce, ciphertext := data[:nonceSize], data[nonceSize:]
 	return gcm.Open(nil, nonce, ciphertext, nil)
+}
+
+
+// InvitePayload holds metadata for a universal Rizoma contact invitation.
+type InvitePayload struct {
+	Version int    `json:"v"`
+	Alias   string `json:"alias"`
+	Onion   string `json:"onion"`
+	Secret  string `json:"secret,omitempty"`
+}
+
+// CreateUniversalInvite creates a standard RIZOMA:v1:<base64> invitation string.
+func CreateUniversalInvite(alias, onionAddr, secret string) string {
+	cleanAddr := strings.TrimSpace(onionAddr)
+	if cleanAddr != "" && !strings.HasSuffix(cleanAddr, ".onion") {
+		cleanAddr += ".onion"
+	}
+	payload := InvitePayload{
+		Version: 1,
+		Alias:   strings.TrimSpace(alias),
+		Onion:   cleanAddr,
+		Secret:  strings.TrimSpace(secret),
+	}
+	b, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return "RIZOMA:v1:" + base64.RawURLEncoding.EncodeToString(b)
+}
+
+// ParseUniversalInviteJSON parses an invitation string (RIZOMA:v1:..., rizoma://... or JSON)
+// and returns a JSON string {"alias":"...","onion":"...","secret":"..."} for gomobile bindings.
+func ParseUniversalInviteJSON(input string) string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return ""
+	}
+
+	lower := strings.ToLower(input)
+
+	// 1. Check RIZOMA:v1: prefix
+	if strings.HasPrefix(lower, "rizoma:v1:") {
+		rawB64 := strings.TrimSpace(input[len("rizoma:v1:"):])
+		data, err := base64.RawURLEncoding.DecodeString(rawB64)
+		if err != nil {
+			data, err = base64.StdEncoding.DecodeString(rawB64)
+		}
+		if err == nil {
+			var p InvitePayload
+			if err := json.Unmarshal(data, &p); err == nil && p.Onion != "" {
+				if !strings.HasSuffix(p.Onion, ".onion") {
+					p.Onion += ".onion"
+				}
+				out, _ := json.Marshal(p)
+				return string(out)
+			}
+		}
+	}
+
+	// 2. Check rizoma:// URI
+	if strings.HasPrefix(lower, "rizoma://") {
+		u, err := url.Parse(input)
+		if err == nil {
+			q := u.Query()
+			al := q.Get("alias")
+			on := q.Get("onion")
+			if on == "" {
+				on = q.Get("addr")
+			}
+			sec := q.Get("secret")
+			if on != "" {
+				if !strings.HasSuffix(on, ".onion") {
+					on += ".onion"
+				}
+				p := InvitePayload{Version: 1, Alias: al, Onion: on, Secret: sec}
+				out, _ := json.Marshal(p)
+				return string(out)
+			}
+		}
+	}
+
+	// 3. Check raw JSON
+	if strings.HasPrefix(input, "{") && strings.HasSuffix(input, "}") {
+		var p InvitePayload
+		if err := json.Unmarshal([]byte(input), &p); err == nil && p.Onion != "" {
+			if !strings.HasSuffix(p.Onion, ".onion") {
+				p.Onion += ".onion"
+			}
+			out, _ := json.Marshal(p)
+			return string(out)
+		}
+	}
+
+	return ""
 }

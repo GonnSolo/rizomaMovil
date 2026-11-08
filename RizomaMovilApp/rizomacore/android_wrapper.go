@@ -8,6 +8,7 @@ import (
 )
 
 // AndroidCallback allows the Android Kotlin code to receive callbacks from Go.
+// Preserves the exact 5-method signature expected by MainActivity.kt and RizomaCore.aar.
 type AndroidCallback interface {
 	OnSystemMessage(msg string)
 	OnPeerMessage(senderName string, senderColor string, msg string)
@@ -17,10 +18,12 @@ type AndroidCallback interface {
 }
 
 // ChatPayload represents the standard JSON chat message exchanged between Rizoma peers.
+// Extended with optional Briar-style AttachmentHeader metadata for multimedia messages.
 type ChatPayload struct {
-	Content string `json:"content"`
-	Name    string `json:"name"`
-	Color   string `json:"color"`
+	Content    string            `json:"content"`
+	Name       string            `json:"name"`
+	Color      string            `json:"color"`
+	Attachment *AttachmentHeader `json:"attachment,omitempty"`
 }
 
 // ConnectAndroid wraps the Connect method for gomobile without an upfront secret (discovers secret dynamically).
@@ -100,6 +103,8 @@ func (nm *NetworkManager) BroadcastWithIdentityAndroid(msg, name, color string) 
 }
 
 // StartEventLoop consumes channels and triggers the Android callback.
+// Supports Briar-inspired progressive attachment states, out-of-order chunk completion,
+// and optional captions attached to multimedia files.
 func (nm *NetworkManager) StartEventLoop(cb AndroidCallback) {
 	transfers := make(map[string]*FileTransferState)
 
@@ -117,22 +122,34 @@ func (nm *NetworkManager) StartEventLoop(cb AndroidCallback) {
 					if json.Unmarshal([]byte(content), &fileMsg) == nil && fileMsg.Type != "" {
 						switch fileMsg.Type {
 						case "file_offer":
-							ReceiveFileChunk(fileMsg, transfers)
-							if cb != nil {
-								cb.OnFileOffer(fileMsg.Filename, fileMsg.FileSize, peerName)
+							state, err := ReceiveFileChunk(fileMsg, transfers)
+							if err == nil && state != nil && cb != nil {
+								cb.OnFileOffer(state.Filename, state.FileSize, peerName)
 							}
 						case "file_chunk":
 							state, err := ReceiveFileChunk(fileMsg, transfers)
 							if err == nil && state != nil && cb != nil {
-								cb.OnFileProgress(fileMsg.Filename, int64(state.Progress), int64(state.TotalChunks))
+								cb.OnFileProgress(state.Filename, int64(state.Progress), int64(state.TotalChunks))
+								// If out-of-order file_end already arrived and this last chunk completed the file:
+								if state.Completed && state.SavedPath != "" {
+									cb.OnFileReceived(state.Filename, state.SavedPath, peerName)
+									if state.Caption != "" {
+										cb.OnPeerMessage(peerName, peerColor, state.Caption)
+									}
+								}
 							}
-						case "file_end":
+						case "file_end", "file_complete":
 							state, err := ReceiveFileChunk(fileMsg, transfers)
-							if err == nil && state != nil && cb != nil {
-								cb.OnFileReceived(fileMsg.Filename, state.SavedPath, peerName)
+							if err == nil && state != nil && state.Completed && cb != nil {
+								cb.OnFileReceived(state.Filename, state.SavedPath, peerName)
+								if state.Caption != "" {
+									cb.OnPeerMessage(peerName, peerColor, state.Caption)
+								}
+							} else if err != nil && cb != nil {
+								cb.OnSystemMessage(fmt.Sprintf("File verification failed from %s (%s): %v", peerName, fileMsg.Filename, err))
 							}
-						case "file_error":
-							ReceiveFileChunk(fileMsg, transfers)
+						case "file_error", "file_cancel":
+							_, _ = ReceiveFileChunk(fileMsg, transfers)
 							if cb != nil {
 								cb.OnSystemMessage(fmt.Sprintf("File transfer error from %s: %s", peerName, fileMsg.Data))
 							}
@@ -173,12 +190,34 @@ func (nm *NetworkManager) StartEventLoop(cb AndroidCallback) {
 	}()
 }
 
-// SendFileBytesAndroid broadcasts file data as an encrypted chunk stream.
+// SendFileBytesAndroid broadcasts file data as an encrypted chunk stream (backward-compatible entrypoint).
 func (nm *NetworkManager) SendFileBytesAndroid(filename string, data []byte) error {
 	if len(data) == 0 {
 		return fmt.Errorf("empty file data")
 	}
 	return SendFileFromBytes(filename, data, nm.Outgoing)
+}
+
+// SendMediaAttachmentAndroid implements Briar's AttachmentCreator + PrivateMessage workflow for Android:
+// 1. Stages and compresses (if image) the attachment locally in "<storageDir>/sent/".
+// 2. Streams the attachment offer, 16KB chunks, and completion frame over Tor.
+// 3. Returns the serialized AttachmentHeader JSON (including local_path, mime_type, width, height, checksum)
+//    so the Android UI can immediately display the multimedia bubble in the conversation.
+func (nm *NetworkManager) SendMediaAttachmentAndroid(filename string, mimeType string, caption string, data []byte) (string, error) {
+	header, processedData, err := stageLocalAttachment(filename, mimeType, caption, data)
+	if err != nil {
+		return "", err
+	}
+
+	if err := SendAttachmentWithHeader(header, processedData, nm.Outgoing); err != nil {
+		return "", err
+	}
+
+	headerJSON, err := json.Marshal(header)
+	if err != nil {
+		return "", err
+	}
+	return string(headerJSON), nil
 }
 
 // SendFilePathAndroid broadcasts a file from the Android filesystem as an encrypted chunk stream.
