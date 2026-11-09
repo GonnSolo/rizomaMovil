@@ -127,7 +127,8 @@ fun ContactsScreen(
     onOpenVoid: () -> Unit,
     onOpenConfig: () -> Unit,
     onAddContact: (Contact) -> Unit,
-    onDeleteContact: (Int) -> Unit
+    onDeleteContact: (Int) -> Unit,
+    onScanQr: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var showAddDialog by remember { mutableStateOf(false) }
@@ -201,7 +202,7 @@ fun ContactsScreen(
 
         Spacer(modifier = Modifier.height(10.dp))
 
-        // Action Bar: My Key Button & Total Contacts Counter
+        // Action Bar: My Key Button, Scan QR Button & Total Contacts Counter
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -215,20 +216,41 @@ fun ContactsScreen(
                 fontWeight = FontWeight.Bold
             )
 
-            // Button to share contact
-            Box(
-                modifier = Modifier
-                    .border(1.dp, TerminalBorder, RoundedCornerShape(2.dp))
-                    .clickable { showMyKeyDialog = true }
-                    .padding(horizontal = 10.dp, vertical = 5.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                Text(
-                    text = "[ COMPARTIR CONTACTO ]",
-                    color = TerminalText,
-                    fontFamily = FontFamily.Monospace,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 12.sp
-                )
+                // Button to scan QR
+                Box(
+                    modifier = Modifier
+                        .border(1.dp, RizomaRed, RoundedCornerShape(2.dp))
+                        .clickable { onScanQr() }
+                        .padding(horizontal = 8.dp, vertical = 5.dp)
+                ) {
+                    Text(
+                        text = "[ ESCANEAR QR ]",
+                        color = RizomaRed,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp
+                    )
+                }
+
+                // Button to share contact
+                Box(
+                    modifier = Modifier
+                        .border(1.dp, TerminalBorder, RoundedCornerShape(2.dp))
+                        .clickable { showMyKeyDialog = true }
+                        .padding(horizontal = 8.dp, vertical = 5.dp)
+                ) {
+                    Text(
+                        text = "[ COMPARTIR ]",
+                        color = TerminalText,
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 11.sp
+                    )
+                }
             }
         }
 
@@ -650,28 +672,48 @@ fun ContactsScreen(
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End,
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Box(
                             modifier = Modifier
-                                .clickable { showAddDialog = false }
+                                .border(1.dp, RizomaRed, RoundedCornerShape(2.dp))
+                                .clickable {
+                                    showAddDialog = false
+                                    onScanQr()
+                                }
                                 .padding(horizontal = 10.dp, vertical = 6.dp)
                         ) {
                             Text(
-                                text = "[ CANCELAR ]",
-                                color = TerminalTextMuted,
+                                text = "[ ESCANEAR QR ]",
+                                color = RizomaRed,
                                 fontFamily = FontFamily.Monospace,
-                                fontSize = 12.sp
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 11.sp
                             )
                         }
 
-                        Spacer(modifier = Modifier.width(8.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .clickable { showAddDialog = false }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = "[ CANCELAR ]",
+                                    color = TerminalTextMuted,
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 12.sp
+                                )
+                            }
 
-                        Box(
-                            modifier = Modifier
-                                .border(1.dp, TerminalBorder, RoundedCornerShape(2.dp))
-                                .clickable {
+                            Box(
+                                modifier = Modifier
+                                    .border(1.dp, TerminalBorder, RoundedCornerShape(2.dp))
+                                    .clickable {
                                     val safeAlias = aliasInput.trim()
                                     val rawKey = keyInput.trim()
 
@@ -740,4 +782,5 @@ fun ContactsScreen(
             }
         }
     }
+}
 }

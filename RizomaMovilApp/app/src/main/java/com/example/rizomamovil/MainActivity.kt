@@ -317,49 +317,32 @@ class MainActivity : ComponentActivity() {
                         }
 
                         Screen.CONTACTS -> {
-                            Box(Modifier.fillMaxSize()) {
-                                ContactsScreen(
-                                    contacts = contacts,
-                                    torStatus = torStatus,
-                                    myNickname = myNickname,
-                                    myOnionAddress = myOnionAddress,
-                                    onOpenChat = { contact ->
-                                        openChatWithContact(contact)
-                                    },
-                                    onOpenVoid = {
-                                        openTheVoidChat()
-                                    },
-                                    onOpenConfig = {
-                                        currentScreen = Screen.CONFIG
-                                    },
-                                    onAddContact = { newContact ->
-                                        cryptoStorage.saveContact(newContact)
-                                        loadContactsData()
-                                    },
-                                    onDeleteContact = { slot ->
-                                        cryptoStorage.deleteContact(slot)
-                                        loadContactsData()
-                                    }
-                                )
-
-                                Box(
-                                    modifier = Modifier
-                                        .align(Alignment.BottomEnd)
-                                        .padding(16.dp)
-                                        .border(1.dp, RizomaRed, RoundedCornerShape(2.dp))
-                                        .background(TerminalBackground)
-                                        .clickable { launchQrScanner() }
-                                        .padding(horizontal = 14.dp, vertical = 11.dp)
-                                ) {
-                                    Text(
-                                        text = "[ ESCANEAR QR ]",
-                                        color = RizomaRed,
-                                        fontFamily = FontFamily.Monospace,
-                                        fontWeight = FontWeight.Bold,
-                                        fontSize = 12.sp
-                                    )
+                            ContactsScreen(
+                                contacts = contacts,
+                                torStatus = torStatus,
+                                myNickname = myNickname,
+                                myOnionAddress = myOnionAddress,
+                                onOpenChat = { contact ->
+                                    openChatWithContact(contact)
+                                },
+                                onOpenVoid = {
+                                    openTheVoidChat()
+                                },
+                                onOpenConfig = {
+                                    currentScreen = Screen.CONFIG
+                                },
+                                onAddContact = { newContact ->
+                                    cryptoStorage.saveContact(newContact)
+                                    loadContactsData()
+                                },
+                                onDeleteContact = { slot ->
+                                    cryptoStorage.deleteContact(slot)
+                                    loadContactsData()
+                                },
+                                onScanQr = {
+                                    launchQrScanner()
                                 }
-                            }
+                            )
                         }
 
                         Screen.CONFIG -> {
